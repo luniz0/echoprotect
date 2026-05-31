@@ -1,0 +1,239 @@
+--- protector/src/pe/image.cpp
+#include "protector/pe/image.hpp"
+#include <cstring>
+
+namespace prt::pe {
+
+static IMAGE_NT_HEADERS64* Nt64(Image& img) {
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(img.file_bytes.data());
+    return reinterpret_cast<IMAGE_NT_HEADERS64*>(img.file_bytes.data() + dos->e_lfanew);
+}
+
+static IMAGE_NT_HEADERS32* Nt32(Image& img) {
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(img.file_bytes.data());
+    return reinterpret_cast<IMAGE_NT_HEADERS32*>(img.file_bytes.data() + dos->e_lfanew);
+}
+
+Status Image::LoadFromFile(const std::wstring& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return Status::Fail("cannot open PE file");
+    file_bytes.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    return PeParser::Parse(*this, file_bytes);
+}
+
+Status Image::SaveToFile(const std::wstring& path) const {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return Status::Fail("cannot write PE file");
+    f.write(reinterpret_cast<const char*>(file_bytes.data()),
+            static_cast<std::streamsize>(file_bytes.size()));
+    return f ? Status::Success() : Status::Fail("write failed");
+}
+
+uint32_t Image::SectionAlignment() const {
+    return is_64 ? nt64.OptionalHeader.SectionAlignment : nt32.OptionalHeader.SectionAlignment;
+}
+
+uint32_t Image::FileAlignment() const {
+    return is_64 ? nt64.OptionalHeader.FileAlignment : nt32.OptionalHeader.FileAlignment;
+}
+
+uint32_t Image::ImageBase() const {
+    return is_64 ? static_cast<uint32_t>(nt64.OptionalHeader.ImageBase)
+                 : nt32.OptionalHeader.ImageBase;
+}
+
+uint32_t Image::EntryPointRva() const {
+    return is_64 ? nt64.OptionalHeader.AddressOfEntryPoint
+                 : nt32.OptionalHeader.AddressOfEntryPoint;
+}
+
+void Image::SetEntryPointRva(uint32_t rva) {
+    if (is_64) nt64.OptionalHeader.AddressOfEntryPoint = rva;
+    else nt32.OptionalHeader.AddressOfEntryPoint = rva;
+}
+
+Section* Image::FindSectionByRva(uint32_t rva) {
+    for (auto& s : sections) {
+  
+----
+
+--- protector/src/cfg/builder.cpp
+#include "protector/cfg/builder.hpp"
+#include <queue>
+
+namespace prt::cfg {
+
+CFGBuilder::CFGBuilder(disasm::ZydisDecoder& dec) : dec_(dec) {}
+
+uint32_t CFGBuilder::GetOrCreateBlock(CfgGraph& g, uint64_t va) {
+    auto it = g.va_to_bb.find(va);
+    if (it != g.va_to_bb.end()) return it->second;
+    BasicBlock bb;
+    bb.id = static_cast<uint32_t>(g.blocks.size());
+    bb.start_va = va;
+    g.va_to_bb[va] = bb.id;
+    g.blocks.push_back(std::move(bb));
+    return g.blocks.back().id;
+}
+
+CfgGraph CFGBuilder::Build(uint64_t entry_va, const uint8_t* code, size_t len,
+                           size_t max_insns) {
+    CfgGraph g;
+    std::queue<uint64_t> worklist;
+    std::unordered_set<uint64_t> visited_starts;
+    worklist.push(entry_va);
+
+    while (!worklist.empty()) {
+        uint64_t va = worklist.front();
+        worklist.pop();
+        if (visited_starts.count(va)) continue;
+        visited_starts.insert(va);
+
+        uint32_t bb_id = GetOrCreateBlock(g, va);
+        BasicBlock& bb = g.blocks[bb_id];
+        bb.start_va = va;
+
+        uint64_t cur = va;
+        size_t insn_count = 0;
+
+        while (true) {
+            if (cur < entry_va) break;
+            size_t offset = static_cast<size_t>(cur - entry_va);
+            if (offset >= len) break;
+            if (insn_count++ >= max_insns) break;
+
+            disasm::Instruction ins{};
+            if (!dec_.DecodeAt(code + offset, len - offset, cur, ins)) break;
+
+            bb.insns.push_back(ins);
+            bb.end_va = cur + ins.length;
+            cur += ins.length;
+
+            if (ins.is_return) break;
+
+            if (ins.is_branch && !ins.is_cond_branch) {
+                uint64_t tgt = ins.branch_target;
+                uint32_t tgt_bb = GetOrCreateBlock(g, tgt);
+                g.AddEdge(bb_id, tgt_bb, Edge::Jump);
+                worklist.push(tgt);
+                if (ins.is_call) worklist.push(cur);
+                break;
+            }
+
+            if (ins.is_cond_branch) {
+                uint64_t tgt
+----
+
+--- protector/src/analysis/vsa.cpp
+#include "protector/analysis/vsa.hpp"
+#include <queue>
+
+namespace prt::analysis {
+
+AbstractValue VsaEngine::Meet(const AbstractValue& a, const AbstractValue& b) const {
+    if (a.kind == AbstractValueKind::Top) return b;
+    if (b.kind == AbstractValueKind::Top) return a;
+    if (a.kind == AbstractValueKind::Const && b.kind == AbstractValueKind::Const) {
+        if (a.constant == b.constant) return a;
+        AbstractValue s;
+        s.kind = AbstractValueKind::Set;
+        s.set_values = {a.constant, b.constant};
+        return s;
+    }
+    return AbstractValue{};
+}
+
+void VsaEngine::Transfer(const disasm::Instruction& ins,
+                         std::array<AbstractValue, kRegCount>& st) {
+    if (ins.mnemonic.find("mov") != std::string::npos && ins.operands.size() >= 2) {
+        if (ins.operands[0].kind == disasm::OperandKind::Reg &&
+            ins.operands[1].kind == disasm::OperandKind::Imm) {
+            uint32_t r = static_cast<uint32_t>(ins.operands[0].reg);
+            if (r < kRegCount) {
+                st[r].kind = AbstractValueKind::Const;
+                st[r].constant = ins.operands[1].imm;
+            }
+        }
+    }
+}
+
+void VsaEngine::RunOnCfg(cfg::CfgGraph& g, uint32_t entry_bb) {
+    std::queue<uint32_t> work;
+    work.push(entry_bb);
+    state_[entry_bb] = {};
+
+    while (!work.empty()) {
+        uint32_t bb_id = work.front();
+        work.pop();
+        auto* bb = g.GetBlock(bb_id);
+        if (!bb) continue;
+
+        auto cur = state_.count(bb_id) ? state_[bb_id] : std::array<AbstractValue, kRegCount>{};
+        for (const auto& ins : bb->insns) Transfer(ins, cur);
+
+        for (const auto& e : bb->succs) {
+            auto& dst = state_[e.to_bb];
+            bool changed = false;
+            for (size_t i = 0; i < kRegCount; ++i) {
+                auto merged = Meet(dst[i], cur[i]);
+                if (merged.kind != dst[i].kind || merged.constant != dst[i].constant) {
+                    dst[i] = merged;
+                    changed = true
+----
+
+--- protector/src/ir/lifter.cpp
+#include "protector/ir/lifter.hpp"
+#include <Zydis/Register.h>
+
+namespace prt::ir {
+
+ValueId Function::NewValue(Type t) {
+    ValueId v{next_value_id++};
+    value_types[v.id] = t;
+    return v;
+}
+
+void Lifter::SetReg(ZydisRegister r, ValueId v) {
+    reg_map_[static_cast<uint64_t>(r)] = v;
+}
+
+ValueId Lifter::GetReg(ZydisRegister r, Function& fn) {
+    auto it = reg_map_.find(static_cast<uint64_t>(r));
+    if (it != reg_map_.end()) return it->second;
+    Type t{TypeKind::I64, 8};
+    ValueId v = fn.NewValue(t);
+    reg_map_[static_cast<uint64_t>(r)] = v;
+    return v;
+}
+
+void Lifter::LiftInsn(const disasm::Instruction& ins, BasicBlock& bb, Function& fn) {
+    if (ins.mnemonic.find("mov") != std::string::npos && ins.operands.size() >= 2) {
+        if (ins.operands[0].kind == disasm::OperandKind::Reg &&
+            ins.operands[1].kind == disasm::OperandKind::Imm) {
+            Instruction ir{};
+            ir.opcode = Opcode::Const;
+            ir.const_imm = ins.operands[1].imm;
+            ir.result = fn.NewValue({TypeKind::I64, 8});
+            bb.insts.push_back(ir);
+            SetReg(ins.operands[0].reg, ir.result);
+            return;
+        }
+        if (ins.operands[0].kind == disasm::OperandKind::Reg &&
+            ins.operands[1].kind == disasm::OperandKind::Reg) {
+            Instruction ir{};
+            ir.opcode = Opcode::Copy;
+            ir.result = fn.NewValue({TypeKind::I64, 8});
+            ir.operands.push_back(GetReg(ins.operands[1].reg, fn));
+            bb.insts.push_back(ir);
+            SetReg(ins.operands[0].reg, ir.result);
+            return;
+        }
+    }
+    if (ins.mnemonic.find("add") != std::string::npos && ins.operands.size() >= 2) {
+        Instruction ir{};
+        ir.opcode = Opcode::Add;
+        ir.result = fn.NewValue({TypeKind::I64, 8});
+        ir.operands.push_back(GetReg(ins.operands[0].reg, fn));
+        if (ins.operands[1].kind == disasm::OperandKind::Reg)
+            ir.operands.push_back(GetReg(ins.operands[1].reg, f
+----

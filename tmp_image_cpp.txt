@@ -1,0 +1,280 @@
+#include "protector/pe/image.hpp"
+#include <cstring>
+
+namespace prt::pe {
+
+static IMAGE_NT_HEADERS64* Nt64(Image& img) {
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(img.file_bytes.data());
+    return reinterpret_cast<IMAGE_NT_HEADERS64*>(img.file_bytes.data() + dos->e_lfanew);
+}
+
+static IMAGE_NT_HEADERS32* Nt32(Image& img) {
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(img.file_bytes.data());
+    return reinterpret_cast<IMAGE_NT_HEADERS32*>(img.file_bytes.data() + dos->e_lfanew);
+}
+
+Status Image::LoadFromFile(const std::wstring& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return Status::Fail("cannot open PE file");
+    file_bytes.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    return PeParser::Parse(*this, file_bytes);
+}
+
+Status Image::SaveToFile(const std::wstring& path) const {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return Status::Fail("cannot write PE file");
+    f.write(reinterpret_cast<const char*>(file_bytes.data()),
+            static_cast<std::streamsize>(file_bytes.size()));
+    return f ? Status::Success() : Status::Fail("write failed");
+}
+
+uint32_t Image::SectionAlignment() const {
+    return is_64 ? nt64.OptionalHeader.SectionAlignment : nt32.OptionalHeader.SectionAlignment;
+}
+
+uint32_t Image::FileAlignment() const {
+    return is_64 ? nt64.OptionalHeader.FileAlignment : nt32.OptionalHeader.FileAlignment;
+}
+
+uint32_t Image::ImageBase() const {
+    return is_64 ? static_cast<uint32_t>(nt64.OptionalHeader.ImageBase)
+                 : nt32.OptionalHeader.ImageBase;
+}
+
+uint32_t Image::EntryPointRva() const {
+    return is_64 ? nt64.OptionalHeader.AddressOfEntryPoint
+                 : nt32.OptionalHeader.AddressOfEntryPoint;
+}
+
+void Image::SetEntryPointRva(uint32_t rva) {
+    if (is_64) nt64.OptionalHeader.AddressOfEntryPoint = rva;
+    else nt32.OptionalHeader.AddressOfEntryPoint = rva;
+}
+
+Section* Image::FindSectionByRva(uint32_t rva) {
+    for (auto& s : sections) {
+        if (rva >= s.virtual_address && rva < s.virtual_address + s.virtual_size)
+            return &s;
+    }
+    return nullptr;
+}
+
+const Section* Image::FindSectionByRva(uint32_t rva) const {
+    return const_cast<Image*>(this)->FindSectionByRva(rva);
+}
+
+uint8_t* Image::RvaToPtr(uint32_t rva) {
+    for (auto& s : sections) {
+        if (rva >= s.virtual_address && rva < s.virtual_address + s.virtual_size) {
+            uint32_t offset = rva - s.virtual_address;
+            if (s.raw_offset + offset >= file_bytes.size()) return nullptr;
+            return file_bytes.data() + s.raw_offset + offset;
+        }
+    }
+    return nullptr;
+}
+
+const uint8_t* Image::RvaToPtr(uint32_t rva) const {
+    return const_cast<Image*>(this)->RvaToPtr(rva);
+}
+
+IMAGE_SECTION_HEADER* Image::SectionHeader(size_t index) {
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(file_bytes.data());
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(file_bytes.data() + dos->e_lfanew);
+    auto* first = IMAGE_FIRST_SECTION(nt);
+    return &first[index];
+}
+
+size_t Image::SectionHeaderCount() const {
+    return is_64 ? nt64.FileHeader.NumberOfSections : nt32.FileHeader.NumberOfSections;
+}
+
+Status PeParser::Parse(Image& out, const std::vector<uint8_t>& data) {
+    if (data.size() < sizeof(IMAGE_DOS_HEADER)) return Status::Fail("too small for DOS");
+    out.file_bytes = data;
+
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(out.file_bytes.data());
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return Status::Fail("invalid DOS signature");
+    if (static_cast<size_t>(dos->e_lfanew) + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER) > out.file_bytes.size())
+        return Status::Fail("invalid e_lfanew");
+
+  auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(out.file_bytes.data() + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return Status::Fail("invalid PE signature");
+
+    out.is_64 = (nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC);
+    if (out.is_64) std::memcpy(&out.nt64, nt, sizeof(IMAGE_NT_HEADERS64));
+    else std::memcpy(&out.nt32, nt, sizeof(IMAGE_NT_HEADERS32));
+
+    const WORD nsects = out.is_64 ? out.nt64.FileHeader.NumberOfSections
+                                  : out.nt32.FileHeader.NumberOfSections;
+    auto* sh = IMAGE_FIRST_SECTION(nt);
+
+    out.sections.clear();
+    for (WORD i = 0; i < nsects; ++i) {
+        Section s;
+        s.name = std::string(reinterpret_cast<const char*>(sh[i].Name),
+                             strnlen(reinterpret_cast<const char*>(sh[i].Name), 8));
+        s.virtual_size = sh[i].Misc.VirtualSize;
+        s.virtual_address = sh[i].VirtualAddress;
+        s.raw_size = sh[i].SizeOfRawData;
+        s.raw_offset = sh[i].PointerToRawData;
+        s.characteristics = sh[i].Characteristics;
+        out.sections.push_back(std::move(s));
+    }
+
+    // Basic reloc parse
+    uint32_t reloc_rva = 0, reloc_sz = 0;
+    if (out.is_64) {
+        reloc_rva = out.nt64.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
+        reloc_sz = out.nt64.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
+    } else {
+        reloc_rva = out.nt32.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
+        reloc_sz = out.nt32.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
+    }
+
+    out.relocs.clear();
+    if (reloc_rva && reloc_sz) {
+        const uint8_t* base = out.RvaToPtr(reloc_rva);
+        if (base) {
+            size_t offset = 0;
+            while (offset + sizeof(IMAGE_BASE_RELOCATION) <= reloc_sz) {
+                auto* block = reinterpret_cast<const IMAGE_BASE_RELOCATION*>(base + offset);
+                if (block->SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION)) break;
+                RelocBlock rb;
+                rb.page_rva = block->VirtualAddress;
+                const size_t count = (block->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / 2;
+                const auto* entries = reinterpret_cast<const uint16_t*>(block + 1);
+                for (size_t i = 0; i < count; ++i) rb.entries.push_back(entries[i]);
+                out.relocs.push_back(std::move(rb));
+                offset += block->SizeOfBlock;
+            }
+        }
+    }
+
+    return Status::Success();
+}
+
+Status PeBuilder::ApplyRelocations(Image& img, uint64_t load_base) {
+    const uint64_t image_base = img.is_64
+        ? img.nt64.OptionalHeader.ImageBase
+        : img.nt32.OptionalHeader.ImageBase;
+    const int64_t delta = static_cast<int64_t>(load_base - image_base);
+    if (delta == 0) return Status::Success();
+
+    for (const auto& block : img.relocs) {
+        for (uint16_t entry : block.entries) {
+            const uint16_t type = entry >> 12;
+            const uint16_t off = entry & 0x0FFF;
+            const uint32_t site_rva = block.page_rva + off;
+            uint8_t* ptr = img.RvaToPtr(site_rva);
+            if (!ptr) continue;
+
+            if (img.is_64 && type == IMAGE_REL_BASED_DIR64) {
+                auto* p = reinterpret_cast<uint64_t*>(ptr);
+                *p = static_cast<uint64_t>(static_cast<int64_t>(*p) + delta);
+            } else if (!img.is_64 && type == IMAGE_REL_BASED_HIGHLOW) {
+                auto* p = reinterpret_cast<uint32_t*>(ptr);
+                *p = static_cast<uint32_t>(static_cast<int64_t>(*p) + delta);
+            }
+        }
+    }
+    return Status::Success();
+}
+
+Status PeBuilder::Rebase(Image& img, uint64_t new_image_base) {
+    if (img.is_64) img.nt64.OptionalHeader.ImageBase = new_image_base;
+    else img.nt32.OptionalHeader.ImageBase = static_cast<DWORD>(new_image_base);
+    return ApplyRelocations(img, new_image_base);
+}
+
+Status PeBuilder::RedirectEntryPoint(Image& img, uint32_t new_ep_rva) {
+    img.SetEntryPointRva(new_ep_rva);
+    return Status::Success();
+}
+
+Status PeBuilder::InjectVmSection(Image& img,
+                                  const std::vector<uint8_t>& stub,
+                                  const std::vector<uint8_t>& bytecode,
+                                  uint32_t stub_entry_rva,
+                                  uint32_t* out_section_rva) {
+    if (!img.is_64) return Status::Fail("only PE32+ supported in this build");
+
+    const uint32_t file_align = img.FileAlignment();
+    const uint32_t sect_align = img.SectionAlignment();
+
+    VmpHeader hdr{};
+    hdr.original_ep_rva = img.EntryPointRva();
+    hdr.stub_size = static_cast<uint32_t>(stub.size());
+    hdr.bytecode_size = static_cast<uint32_t>(bytecode.size());
+
+    uint32_t file_end = 0;
+    for (const auto& s : img.sections) {
+        file_end = std::max(file_end, s.raw_offset + s.raw_size);
+    }
+
+    const auto& last = img.sections.back();
+    const uint32_t new_va = AlignUp(last.virtual_address + last.virtual_size, sect_align);
+    const uint32_t new_raw = AlignUp(file_end, file_align);
+
+    const uint32_t hdr_off = 0;
+    const uint32_t stub_off = AlignUp(sizeof(VmpHeader), 16u);
+    const uint32_t bc_off = AlignUp(stub_off + static_cast<uint32_t>(stub.size()), 16u);
+    const uint32_t total_raw = AlignUp(bc_off + static_cast<uint32_t>(bytecode.size()), file_align);
+
+    hdr.stub_rva = new_va + stub_off;
+    hdr.bytecode_rva = new_va + bc_off;
+
+    std::vector<uint8_t> section_data(total_raw, 0);
+    std::memcpy(section_data.data(), &hdr, sizeof(hdr));
+    if (!stub.empty()) std::memcpy(section_data.data() + stub_off, stub.data(), stub.size());
+    if (!bytecode.empty()) std::memcpy(section_data.data() + bc_off, bytecode.data(), bytecode.size());
+
+  auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(img.file_bytes.data());
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(img.file_bytes.data() + dos->e_lfanew);
+    WORD n = nt->FileHeader.NumberOfSections;
+    auto* sh = IMAGE_FIRST_SECTION(nt);
+
+    if (img.file_bytes.size() < new_raw + new_raw) {
+        img.file_bytes.resize(new_raw + total_raw);
+    } else if (img.file_bytes.size() < new_raw + total_raw) {
+        img.file_bytes.resize(new_raw + total_raw);
+    }
+    if (img.file_bytes.size() < new_raw + total_raw)
+        img.file_bytes.resize(new_raw + total_raw);
+
+    std::memcpy(img.file_bytes.data() + new_raw, section_data.data(), section_data.size());
+
+    IMAGE_SECTION_HEADER new_sh{};
+    std::memcpy(new_sh.Name, ".vmp", 4);
+    new_sh.Misc.VirtualSize = AlignUp(total_raw, sect_align);
+    new_sh.VirtualAddress = new_va;
+    new_sh.SizeOfRawData = total_raw;
+    new_sh.PointerToRawData = new_raw;
+    new_sh.Characteristics = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE;
+
+    const size_t headers_end = dos->e_lfanew + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER) +
+        nt->FileHeader.SizeOfOptionalHeader + (n + 1) * sizeof(IMAGE_SECTION_HEADER);
+    if (img.file_bytes.size() < headers_end)
+        img.file_bytes.resize(headers_end);
+
+    std::memmove(sh + 1, sh, n * sizeof(IMAGE_SECTION_HEADER));
+    sh[0] = new_sh;
+
+    nt->FileHeader.NumberOfSections = n + 1;
+    nt->OptionalHeader.SizeOfImage = AlignUp(new_va + new_sh.Misc.VirtualSize, sect_align);
+
+    Section s;
+    s.name = ".vmp";
+    s.virtual_size = new_sh.Misc.VirtualSize;
+    s.virtual_address = new_va;
+    s.raw_size = total_raw;
+    s.raw_offset = new_raw;
+    s.characteristics = new_sh.Characteristics;
+    img.sections.push_back(s);
+
+    if (out_section_rva) *out_section_rva = new_va;
+    (void)stub_entry_rva;
+    return RedirectEntryPoint(img, new_va + stub_off);
+}
+
+} // namespace prt::pe
